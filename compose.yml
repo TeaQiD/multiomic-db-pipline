@@ -1,0 +1,8 @@
+services:
+  pipeline:
+    build:
+      context: .
+      dockerfile: Containerfile
+    volumes:
+      - ./data:/app/data
+      - ./scripts:/app/scripts
