@@ -3,11 +3,11 @@
 import sys
 import os
 import io
+import csv
 import time
 import json
 import tarfile
 import requests
-import pandas as pd
 
 FILES_ENDPOINT = "https://api.gdc.cancer.gov/files"
 DATA_ENDPOINT = "https://api.gdc.cancer.gov/data"
@@ -96,12 +96,16 @@ def query_file_manifest():
     return manifest
 
 
-def parse_star_tsv(content: bytes, sample_id: str):
-    """Parse a STAR Counts TSV file and return long-format rows."""
-    lines = content.decode("utf-8").splitlines()
-    rows = []
-    for line in lines:
-        if line.startswith("#") or line.startswith("N_"):
+def parse_star_tsv_to_writer(content: bytes, sample_id: str, writer):
+    """Parse a STAR Counts TSV and write rows directly to a csv.writer.
+
+    Returns the number of rows written. Streams line-by-line so we never
+    materialize the full gene set in memory.
+    """
+    n = 0
+    text = content.decode("utf-8")
+    for line in text.splitlines():
+        if not line or line[0] == "#" or line.startswith("N_"):
             continue
         parts = line.split("\t")
         if len(parts) < 8:
@@ -111,67 +115,84 @@ def parse_star_tsv(content: bytes, sample_id: str):
             fpkm = float(parts[7])  # fpkm_unstranded column
         except (ValueError, IndexError):
             continue
-        rows.append({"sample_id": sample_id, "gene_id": gene_id, "expression_value": fpkm})
-    return rows
+        writer.writerow((sample_id, gene_id, fpkm))
+        n += 1
+    return n
 
 
-def download_batch(file_ids, id_to_sample):
-    """POST a batch of file IDs to GDC /data, untar, parse TSVs."""
+def download_and_write_batch(file_ids, id_to_sample, writer):
+    """POST a batch of file IDs, untar, parse TSVs, stream rows to the CSV writer.
+
+    Returns the number of rows written for this batch.
+    """
     payload = json.dumps({"ids": file_ids})
     resp = requests.post(
         DATA_ENDPOINT,
         data=payload,
         headers={"Content-Type": "application/json"},
         timeout=600,
-        stream=True,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"[rnaseq] Data download HTTP {resp.status_code}")
+        raise RuntimeError(
+            f"[rnaseq] Data download HTTP {resp.status_code}: {resp.content[:200]!r}"
+        )
 
     raw = io.BytesIO(resp.content)
-    all_rows = []
+    batch_rows = 0
     with tarfile.open(fileobj=raw, mode="r:gz") as tar:
-        for member in tar.getmembers():
+        for member in tar:
             if not member.name.endswith(".tsv"):
                 continue
-            # member.name is like "{file_uuid}/{filename}.tsv"
-            parts = member.name.split("/")
-            file_uuid = parts[0] if len(parts) > 1 else ""
-            sample_id = id_to_sample.get(file_uuid, "")
+            # member.name is "{file_uuid}/{filename}.tsv"
+            uuid = member.name.split("/", 1)[0]
+            sample_id = id_to_sample.get(uuid, "")
             if not sample_id:
                 continue
             fobj = tar.extractfile(member)
             if fobj is None:
                 continue
-            content = fobj.read()
-            all_rows.extend(parse_star_tsv(content, sample_id))
-    return all_rows
+            batch_rows += parse_star_tsv_to_writer(fobj.read(), sample_id, writer)
+    # Free the tar.gz bytes ASAP
+    del raw
+    return batch_rows
 
 
 def main():
     datadir = sys.argv[1] if len(sys.argv) > 1 else "data"
     os.makedirs(datadir, exist_ok=True)
 
-    print("[rnaseq] Querying GDC file manifest ...")
+    print("[rnaseq] Querying GDC file manifest ...", flush=True)
     manifest = query_file_manifest()
-    print(f"[rnaseq] Found {len(manifest)} STAR Counts files")
+    print(f"[rnaseq] Found {len(manifest)} STAR Counts files", flush=True)
 
     id_to_sample = {m["file_id"]: m["sample_id"] for m in manifest}
     file_ids = list(id_to_sample.keys())
 
-    all_rows = []
-    for i in range(0, len(file_ids), BATCH_SIZE):
-        batch = file_ids[i : i + BATCH_SIZE]
-        print(f"[rnaseq] Downloading batch {i // BATCH_SIZE + 1} ({len(batch)} files) ...")
-        rows = download_batch(batch, id_to_sample)
-        all_rows.extend(rows)
-        print(f"[rnaseq]   Batch yielded {len(rows)} expression rows (total so far: {len(all_rows)})")
-        time.sleep(SLEEP)
-
-    df = pd.DataFrame(all_rows)
     out_path = os.path.join(datadir, "tcga_rnaseq.csv")
-    df.to_csv(out_path, index=False, encoding="utf-8")
-    print(f"[rnaseq] Saved {len(df)} rows to {out_path}")
+    total_rows = 0
+    n_batches = (len(file_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    with open(out_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(("sample_id", "gene_id", "expression_value"))
+
+        for i in range(0, len(file_ids), BATCH_SIZE):
+            batch_idx = i // BATCH_SIZE + 1
+            batch = file_ids[i : i + BATCH_SIZE]
+            print(
+                f"[rnaseq] Batch {batch_idx}/{n_batches}: downloading {len(batch)} files ...",
+                flush=True,
+            )
+            n = download_and_write_batch(batch, id_to_sample, writer)
+            total_rows += n
+            fh.flush()
+            print(
+                f"[rnaseq]   Batch {batch_idx}: +{n:,} rows (total {total_rows:,})",
+                flush=True,
+            )
+            time.sleep(SLEEP)
+
+    print(f"[rnaseq] Saved {total_rows:,} rows to {out_path}", flush=True)
 
 
 if __name__ == "__main__":

@@ -81,8 +81,14 @@ def load_csv(path, label):
     return df
 
 
-def build_samples(clinical_df, rnaseq_df, rppa_df, prot_df):
-    """Combine all sources into the samples table."""
+def build_samples(clinical_df, rnaseq_samples, proteomics_samples, cptac_sample_ids):
+    """Combine all sources into the samples table.
+
+    rnaseq_samples and proteomics_samples are sets collected while streaming
+    the large CSVs into SQLite (so we never need to load them into pandas).
+    cptac_sample_ids is the set of CPTAC sample_ids seen in the proteomics CSV
+    that aren't in clinical_df (so we can add CPTAC-CCRCC rows to samples).
+    """
     rows = {}
 
     if clinical_df is not None:
@@ -101,29 +107,39 @@ def build_samples(clinical_df, rnaseq_df, rppa_df, prot_df):
                 "has_proteomics": 0,
             }
 
-    if prot_df is not None:
-        for sid in prot_df["sample_id"].unique():
-            sid = str(sid)
-            if sid not in rows:
-                rows[sid] = {
-                    "sample_id": sid,
-                    "case_id": "",
-                    "cohort": "CPTAC-CCRCC",
-                    "cancer_type": "clear cell renal cell carcinoma",
-                    "has_rnaseq": 0,
-                    "has_proteomics": 0,
-                }
+    # Add CPTAC samples not already in rows (CPTAC has no TCGA-style clinical join)
+    for sid in cptac_sample_ids:
+        if sid not in rows:
+            rows[sid] = {
+                "sample_id": sid,
+                "case_id": "",
+                "cohort": "CPTAC-CCRCC",
+                "cancer_type": "clear cell renal cell carcinoma",
+                "has_rnaseq": 0,
+                "has_proteomics": 0,
+            }
 
-    # Set flags
-    rnaseq_samples = set(rnaseq_df["sample_id"].astype(str).unique()) if rnaseq_df is not None else set()
-    rppa_samples = set(rppa_df["sample_id"].astype(str).unique()) if rppa_df is not None else set()
-    prot_samples = set(prot_df["sample_id"].astype(str).unique()) if prot_df is not None else set()
-
+    # Set has_* flags from the streaming sets
     for sid, rec in rows.items():
         rec["has_rnaseq"] = 1 if sid in rnaseq_samples else 0
-        rec["has_proteomics"] = 1 if (sid in rppa_samples or sid in prot_samples) else 0
+        rec["has_proteomics"] = 1 if sid in proteomics_samples else 0
 
     return pd.DataFrame(list(rows.values()))
+
+
+def stream_csv_to_table(con, csv_path, table, cols, chunksize=500_000):
+    """Stream a CSV into a SQLite table in chunks; return the set of sample_ids seen.
+
+    Uses append mode so the caller is responsible for clearing the table first.
+    """
+    samples = set()
+    total = 0
+    for chunk in pd.read_csv(csv_path, chunksize=chunksize, low_memory=False):
+        chunk[cols].to_sql(table, con, if_exists="append", index=False)
+        samples.update(chunk["sample_id"].astype(str).unique())
+        total += len(chunk)
+        print(f"[db]   {table}: {total:,} rows loaded ({len(samples)} unique samples so far)")
+    return samples, total
 
 
 def build_clinical_annotations(clinical_df, cptac_clin_df):
@@ -220,55 +236,91 @@ def main():
     db_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(datadir, "multiomics.db")
     os.makedirs(datadir, exist_ok=True)
 
-    # Load CSVs
+    # Small CSVs: load fully (a few MB each)
     clinical_df = load_csv(os.path.join(datadir, "tcga_clinical.csv"), "TCGA clinical")
-    rnaseq_df = load_csv(os.path.join(datadir, "tcga_rnaseq.csv"), "TCGA RNA-seq")
-    rppa_df = load_csv(os.path.join(datadir, "tcga_rppa.csv"), "TCGA RPPA")
-    prot_df = load_csv(os.path.join(datadir, "cptac_ccrcc_proteomics.csv"), "CPTAC proteomics")
     cptac_clin_df = load_csv(os.path.join(datadir, "cptac_ccrcc_clinical.csv"), "CPTAC clinical")
 
     print(f"[db] Building database at {db_path} ...")
+    # Remove any stale DB so we start clean (to_sql with append would otherwise grow)
+    if os.path.exists(db_path):
+        os.remove(db_path)
     con = sqlite3.connect(db_path)
+
+    # Bulk-insert tuning — huge speedup for millions of rows
+    con.execute("PRAGMA journal_mode = OFF")
+    con.execute("PRAGMA synchronous = OFF")
+    con.execute("PRAGMA temp_store = MEMORY")
+    con.execute("PRAGMA cache_size = -200000")  # ~200 MB page cache
+
     con.executescript(SCHEMA)
 
-    # file_manifest
-    manifest_df = build_file_manifest(datadir, clinical_df, rnaseq_df, rppa_df, prot_df)
+    # --- Stream RNA-seq (the big one) ---
+    rnaseq_csv = os.path.join(datadir, "tcga_rnaseq.csv")
+    rnaseq_samples = set()
+    rnaseq_total = 0
+    if os.path.exists(rnaseq_csv):
+        print("[db] Streaming rnaseq_matrix ...")
+        rnaseq_samples, rnaseq_total = stream_csv_to_table(
+            con, rnaseq_csv, "rnaseq_matrix",
+            ["sample_id", "gene_id", "expression_value"],
+        )
+        con.commit()
+        print(f"[db] rnaseq_matrix: {rnaseq_total:,} rows total")
+    else:
+        print(f"[db] WARNING: {rnaseq_csv} not found, skipping rnaseq_matrix")
+
+    # --- Stream proteomics (RPPA + CPTAC into one table) ---
+    proteomics_samples = set()
+    cptac_sample_ids = set()
+    prot_total = 0
+    for label, csv_name, is_cptac in [
+        ("RPPA", "tcga_rppa.csv", False),
+        ("CPTAC proteomics", "cptac_ccrcc_proteomics.csv", True),
+    ]:
+        path = os.path.join(datadir, csv_name)
+        if not os.path.exists(path):
+            print(f"[db] WARNING: {path} not found, skipping {label}")
+            continue
+        print(f"[db] Streaming {label} into proteomics_matrix ...")
+        samples, n = stream_csv_to_table(
+            con, path, "proteomics_matrix",
+            ["sample_id", "protein_id", "abundance_value", "platform"],
+        )
+        proteomics_samples.update(samples)
+        if is_cptac:
+            cptac_sample_ids.update(samples)
+        prot_total += n
+        con.commit()
+    print(f"[db] proteomics_matrix: {prot_total:,} rows total")
+
+    # --- Small tables built in memory ---
+    manifest_df = build_file_manifest(datadir, clinical_df, None, None, None)
     manifest_df.to_sql("file_manifest", con, if_exists="replace", index=False)
     print(f"[db] file_manifest: {len(manifest_df)} rows")
 
-    # samples
-    samples_df = build_samples(clinical_df, rnaseq_df, rppa_df, prot_df)
+    samples_df = build_samples(clinical_df, rnaseq_samples, proteomics_samples, cptac_sample_ids)
     samples_df.to_sql("samples", con, if_exists="replace", index=False)
-    print(f"[db] samples: {len(samples_df)} rows")
+    print(f"[db] samples: {len(samples_df)} rows "
+          f"(has_rnaseq={int(samples_df['has_rnaseq'].sum())}, "
+          f"has_proteomics={int(samples_df['has_proteomics'].sum())})")
 
-    # clinical_annotations
     clin_ann_df = build_clinical_annotations(clinical_df, cptac_clin_df)
     clin_ann_df.to_sql("clinical_annotations", con, if_exists="replace", index=False)
     print(f"[db] clinical_annotations: {len(clin_ann_df)} rows")
 
-    # rnaseq_matrix
-    if rnaseq_df is not None:
-        rnaseq_df[["sample_id", "gene_id", "expression_value"]].to_sql(
-            "rnaseq_matrix", con, if_exists="replace", index=False
-        )
-        print(f"[db] rnaseq_matrix: {len(rnaseq_df)} rows")
-
-    # proteomics_matrix (RPPA + CPTAC)
-    prot_parts = []
-    if rppa_df is not None:
-        prot_parts.append(rppa_df[["sample_id", "protein_id", "abundance_value", "platform"]])
-    if prot_df is not None:
-        prot_parts.append(prot_df[["sample_id", "protein_id", "abundance_value", "platform"]])
-    if prot_parts:
-        prot_combined = pd.concat(prot_parts, ignore_index=True)
-        prot_combined.to_sql("proteomics_matrix", con, if_exists="replace", index=False)
-        print(f"[db] proteomics_matrix: {len(prot_combined)} rows")
-
-    # Empty tables for future aims
-    con.execute("DELETE FROM masking_experiments")
-    con.execute("DELETE FROM integrated_outputs")
+    # Empty tables for future aims (created empty via SCHEMA, nothing to do)
     con.commit()
 
+    # Create useful indices for downstream querying
+    print("[db] Creating indices ...")
+    con.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_rnaseq_sample ON rnaseq_matrix(sample_id);
+        CREATE INDEX IF NOT EXISTS idx_rnaseq_gene   ON rnaseq_matrix(gene_id);
+        CREATE INDEX IF NOT EXISTS idx_prot_sample   ON proteomics_matrix(sample_id);
+        CREATE INDEX IF NOT EXISTS idx_prot_protein  ON proteomics_matrix(protein_id);
+        CREATE INDEX IF NOT EXISTS idx_clin_sample   ON clinical_annotations(sample_id);
+    """)
+    con.commit()
     con.close()
     print(f"[db] Done. Database written to {db_path}")
 

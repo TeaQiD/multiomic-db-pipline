@@ -2,11 +2,10 @@
 
 import sys
 import os
-import io
+import csv
 import time
 import json
 import requests
-import pandas as pd
 
 FILES_ENDPOINT = "https://api.gdc.cancer.gov/files"
 DATA_ENDPOINT = "https://api.gdc.cancer.gov/data"
@@ -89,34 +88,50 @@ def query_rppa_manifest():
     return manifest
 
 
-def download_and_parse_rppa(file_id, sample_id):
-    """Download a single RPPA file and return long-format rows.
-
-    The GDC RPPA TSV has a header line followed by rows with columns:
-    AGID, lab_id, catalog_number, set_id, peptide_target, protein_expression.
-    We use peptide_target as protein_id and protein_expression as abundance.
+def download_and_write_rppa(file_id, sample_id, writer, max_retries=5):
+    """Download a single RPPA file and write rows directly to csv.writer.
+    Returns number of rows written. Retries with exponential backoff on
+    transient network errors (read timeouts, connection errors).
     """
-    resp = requests.get(
-        f"{DATA_ENDPOINT}/{file_id}",
-        timeout=120,
-    )
-    if resp.status_code != 200:
-        print(f"[rppa]   WARNING: HTTP {resp.status_code} for file {file_id}, skipping")
-        return []
+    resp = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(f"{DATA_ENDPOINT}/{file_id}", timeout=120)
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt == max_retries:
+                print(
+                    f"[rppa]   WARNING: {type(e).__name__} on {file_id} after "
+                    f"{max_retries} attempts, skipping: {e}",
+                    flush=True,
+                )
+                return 0
+            backoff = 2 ** attempt  # 2, 4, 8, 16, 32 seconds
+            print(
+                f"[rppa]   {type(e).__name__} on {file_id} (attempt {attempt}/{max_retries}), "
+                f"retrying in {backoff}s ...",
+                flush=True,
+            )
+            time.sleep(backoff)
+
+    if resp is None or resp.status_code != 200:
+        code = resp.status_code if resp is not None else "no-response"
+        print(f"[rppa]   WARNING: HTTP {code} for file {file_id}, skipping", flush=True)
+        return 0
 
     lines = resp.content.decode("utf-8").splitlines()
     if not lines:
-        return []
+        return 0
 
     header = lines[0].split("\t")
     try:
         protein_col = header.index("peptide_target")
         value_col = header.index("protein_expression")
     except ValueError:
-        print(f"[rppa]   WARNING: unexpected header in {file_id}: {header}")
-        return []
+        print(f"[rppa]   WARNING: unexpected header in {file_id}: {header}", flush=True)
+        return 0
 
-    rows = []
+    n = 0
     for line in lines[1:]:
         if not line.strip():
             continue
@@ -128,34 +143,40 @@ def download_and_parse_rppa(file_id, sample_id):
             abundance = float(parts[value_col])
         except ValueError:
             continue
-        rows.append({
-            "sample_id": sample_id,
-            "protein_id": protein_id,
-            "abundance_value": abundance,
-            "platform": "RPPA",
-        })
-    return rows
+        writer.writerow((sample_id, protein_id, abundance, "RPPA"))
+        n += 1
+    return n
 
 
 def main():
     datadir = sys.argv[1] if len(sys.argv) > 1 else "data"
     os.makedirs(datadir, exist_ok=True)
 
-    print("[rppa] Querying GDC RPPA file manifest ...")
+    print("[rppa] Querying GDC RPPA file manifest ...", flush=True)
     manifest = query_rppa_manifest()
-    print(f"[rppa] Found {len(manifest)} RPPA files")
+    print(f"[rppa] Found {len(manifest)} RPPA files", flush=True)
 
-    all_rows = []
-    for i, entry in enumerate(manifest):
-        print(f"[rppa] Downloading file {i + 1}/{len(manifest)}: {entry['file_name']} ...")
-        rows = download_and_parse_rppa(entry["file_id"], entry["sample_id"])
-        all_rows.extend(rows)
-        time.sleep(SLEEP)
-
-    df = pd.DataFrame(all_rows)
     out_path = os.path.join(datadir, "tcga_rppa.csv")
-    df.to_csv(out_path, index=False, encoding="utf-8")
-    print(f"[rppa] Saved {len(df)} rows to {out_path}")
+    total_rows = 0
+
+    with open(out_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(("sample_id", "protein_id", "abundance_value", "platform"))
+
+        for i, entry in enumerate(manifest, 1):
+            if i % 50 == 0 or i == 1 or i == len(manifest):
+                print(
+                    f"[rppa] File {i}/{len(manifest)}: {entry['file_name']} (total so far: {total_rows:,})",
+                    flush=True,
+                )
+            total_rows += download_and_write_rppa(
+                entry["file_id"], entry["sample_id"], writer
+            )
+            if i % 100 == 0:
+                fh.flush()
+            time.sleep(SLEEP)
+
+    print(f"[rppa] Saved {total_rows:,} rows to {out_path}", flush=True)
 
 
 if __name__ == "__main__":
