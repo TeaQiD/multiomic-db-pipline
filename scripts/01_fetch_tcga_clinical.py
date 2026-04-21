@@ -25,6 +25,9 @@ FIELDS = [
 PAGE_SIZE = 500
 SLEEP = 0.3
 
+TEST_MODE = os.environ.get("PIPELINE_MODE", "test") == "test"
+TEST_CASES_PER_PROJECT = 50  # tiny but covers both cohorts
+
 
 def flatten_case(case):
     """Flatten one GDC case record into one row per sample."""
@@ -60,20 +63,23 @@ def flatten_case(case):
 
 
 def fetch_project(project_id):
-    print(f"[clinical] Querying {project_id} ...")
+    mode_note = " [TEST MODE]" if TEST_MODE else ""
+    print(f"[clinical] Querying {project_id}{mode_note} ...")
     filters = {
         "op": "=",
         "content": {"field": "project.project_id", "value": project_id},
     }
     all_rows = []
     from_offset = 0
+    page_size = TEST_CASES_PER_PROJECT if TEST_MODE else PAGE_SIZE
+    limit = TEST_CASES_PER_PROJECT if TEST_MODE else None
 
     while True:
         params = {
             "filters": json.dumps(filters),
             "fields": ",".join(FIELDS),
             "format": "json",
-            "size": PAGE_SIZE,
+            "size": page_size,
             "from": from_offset,
         }
         resp = requests.get(ENDPOINT, params=params, timeout=120)
@@ -93,6 +99,8 @@ def fetch_project(project_id):
         print(f"[clinical]   {project_id}: {from_offset}/{total} cases fetched")
 
         if from_offset >= total:
+            break
+        if limit is not None and from_offset >= limit:
             break
         time.sleep(SLEEP)
 

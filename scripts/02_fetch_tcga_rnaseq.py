@@ -16,6 +16,9 @@ PAGE_SIZE = 500
 BATCH_SIZE = 100
 SLEEP = 0.3
 
+TEST_MODE = os.environ.get("PIPELINE_MODE", "test") == "test"
+TEST_MAX_FILES = 20  # small enough for ~1 min download, ~1M rows
+
 
 def query_file_manifest():
     """Return list of {file_id, file_name, sample_id, project_id} for STAR Counts TSVs."""
@@ -161,9 +164,14 @@ def main():
     datadir = sys.argv[1] if len(sys.argv) > 1 else "data"
     os.makedirs(datadir, exist_ok=True)
 
-    print("[rnaseq] Querying GDC file manifest ...", flush=True)
+    mode_note = " [TEST MODE]" if TEST_MODE else ""
+    print(f"[rnaseq] Querying GDC file manifest{mode_note} ...", flush=True)
     manifest = query_file_manifest()
     print(f"[rnaseq] Found {len(manifest)} STAR Counts files", flush=True)
+
+    if TEST_MODE:
+        manifest = manifest[:TEST_MAX_FILES]
+        print(f"[rnaseq] TEST MODE: limiting to first {len(manifest)} files", flush=True)
 
     id_to_sample = {m["file_id"]: m["sample_id"] for m in manifest}
     file_ids = list(id_to_sample.keys())

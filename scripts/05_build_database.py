@@ -119,6 +119,33 @@ def build_samples(clinical_df, rnaseq_samples, proteomics_samples, cptac_sample_
                 "has_proteomics": 0,
             }
 
+    # Add TCGA RNA-seq samples that have no clinical row (common in test mode
+    # when the sampled RNA-seq files don't overlap with the sampled clinical
+    # cases; also possible in full mode for samples missing clinical metadata)
+    for sid in rnaseq_samples:
+        if sid not in rows:
+            rows[sid] = {
+                "sample_id": sid,
+                "case_id": "",
+                "cohort": "TCGA",
+                "cancer_type": "",
+                "has_rnaseq": 0,
+                "has_proteomics": 0,
+            }
+
+    # Same for RPPA (TCGA proteomics) samples not in clinical/CPTAC
+    tcga_prot_samples = proteomics_samples - cptac_sample_ids
+    for sid in tcga_prot_samples:
+        if sid not in rows:
+            rows[sid] = {
+                "sample_id": sid,
+                "case_id": "",
+                "cohort": "TCGA",
+                "cancer_type": "",
+                "has_rnaseq": 0,
+                "has_proteomics": 0,
+            }
+
     # Set has_* flags from the streaming sets
     for sid, rec in rows.items():
         rec["has_rnaseq"] = 1 if sid in rnaseq_samples else 0

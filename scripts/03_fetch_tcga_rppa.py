@@ -13,6 +13,9 @@ PROJECTS = ["TCGA-BRCA", "TCGA-KIRC"]
 PAGE_SIZE = 500
 SLEEP = 0.3
 
+TEST_MODE = os.environ.get("PIPELINE_MODE", "test") == "test"
+TEST_MAX_FILES = 20  # ~5K rows, covers both cohorts
+
 
 def query_rppa_manifest():
     """Return list of {file_id, file_name, sample_id} for RPPA files."""
@@ -152,9 +155,14 @@ def main():
     datadir = sys.argv[1] if len(sys.argv) > 1 else "data"
     os.makedirs(datadir, exist_ok=True)
 
-    print("[rppa] Querying GDC RPPA file manifest ...", flush=True)
+    mode_note = " [TEST MODE]" if TEST_MODE else ""
+    print(f"[rppa] Querying GDC RPPA file manifest{mode_note} ...", flush=True)
     manifest = query_rppa_manifest()
     print(f"[rppa] Found {len(manifest)} RPPA files", flush=True)
+
+    if TEST_MODE:
+        manifest = manifest[:TEST_MAX_FILES]
+        print(f"[rppa] TEST MODE: limiting to first {len(manifest)} files", flush=True)
 
     out_path = os.path.join(datadir, "tcga_rppa.csv")
     total_rows = 0

@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Containerfile
+    environment:
+      - PIPELINE_MODE=${PIPELINE_MODE:-test}
     volumes:
       - ./data:/app/data
       - ./scripts:/app/scripts
