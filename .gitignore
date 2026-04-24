@@ -1,4 +1,6 @@
 data/
+figures/
 __pycache__/
 *.pyc
 .*.done
+.DS_Store
