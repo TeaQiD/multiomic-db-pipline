@@ -13,3 +13,4 @@ full:
 clean:
     podman compose down --rmi all 2>/dev/null || true
     rm -f data/*.db data/*.csv data/.*.done
+    rm -f figures/*.png

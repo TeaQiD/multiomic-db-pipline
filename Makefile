@@ -1,4 +1,5 @@
 DATADIR := /app/data
+FIGDIR  := /app/figures
 DB      := $(DATADIR)/multiomics.db
 PYTHON  := python
 
@@ -6,7 +7,7 @@ export PYTHONUNBUFFERED := 1
 
 .PHONY: all
 
-all: $(DATADIR)/abundance_missingness.csv
+all: $(FIGDIR)/abundance_missingness.png
 
 $(DATADIR)/.clinical.done:
 	$(PYTHON) scripts/01_fetch_tcga_clinical.py $(DATADIR)
@@ -29,3 +30,6 @@ $(DB): $(DATADIR)/.rnaseq.done $(DATADIR)/.rppa.done $(DATADIR)/.cptac.done
 
 $(DATADIR)/abundance_missingness.csv: $(DB)
 	$(PYTHON) scripts/06_analyze.py $(DATADIR) $(DB)
+
+$(FIGDIR)/abundance_missingness.png: $(DATADIR)/abundance_missingness.csv
+	$(PYTHON) scripts/07_plot.py $(DATADIR) $(FIGDIR)
